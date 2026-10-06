@@ -1,0 +1,30 @@
+package com.github.feng111627.pipelinereleaseorchestratorjava.model;
+
+/**
+ * 所有被拒绝操作的原因码。每个原因码都稳定对外可见，
+ * 调用方据此区分「版本已存在」「版本回退」等不同情形。
+ */
+public enum RejectReason {
+    PIPELINE_NOT_FOUND,
+    VERSION_NOT_FOUND,
+    RUN_NOT_FOUND,
+
+    INVALID_REQUEST,
+    INVALID_VERSION,
+    INVALID_ENVIRONMENT,
+
+    VERSION_ALREADY_EXISTS,
+    VERSION_REGRESSION,
+    VERSION_BLOCKED,
+
+    SOURCE_ENVIRONMENT_EMPTY,
+    PROMOTION_SKIPPED_ENVIRONMENT,
+    PROMOTION_VERSION_MISMATCH,
+    ALREADY_AT_ENVIRONMENT,
+    NO_ROLLBACK_TARGET,
+
+    RUN_ALREADY_ACTIVE,
+    RUN_NOT_CANCELLABLE,
+    RETRY_NOT_ALLOWED,
+    RETRY_ALREADY_ACTIVE
+}
