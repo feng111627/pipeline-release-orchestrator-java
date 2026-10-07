@@ -1,6 +1,7 @@
 package com.github.feng111627.pipelinereleaseorchestratorjava.web;
 
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.CreatePipelineRequest;
+import com.github.feng111627.pipelinereleaseorchestratorjava.dto.BatchDeliveryRequest;
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.PromoteRequest;
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.RollbackRequest;
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.SubmitVersionRequest;
@@ -94,6 +95,34 @@ public class ApiController {
     public Object rollback(@PathVariable String pipelineId,
                            @RequestBody RollbackRequest request) {
         return service.rollback(pipelineId, request);
+    }
+
+    // ---------------- 批量交付 ----------------
+
+    /** 预演：只给出顺序与 from->to（或被卡的位置），绝不改状态。 */
+    @PostMapping("/pipelines/{pipelineId}/deliveries/preview")
+    public Object previewDelivery(@PathVariable String pipelineId,
+                                  @RequestBody BatchDeliveryRequest request) {
+        return service.previewDelivery(pipelineId, request);
+    }
+
+    /** 执行批量交付；首次生效返回 201，幂等复用返回 200（reused=true）。 */
+    @PostMapping("/pipelines/{pipelineId}/deliveries")
+    public ResponseEntity<Object> deliver(@PathVariable String pipelineId,
+                                          @RequestBody BatchDeliveryRequest request) {
+        var record = service.deliver(pipelineId, request);
+        HttpStatus status = record.isReused() ? HttpStatus.OK : HttpStatus.CREATED;
+        return ResponseEntity.status(status).body(record);
+    }
+
+    @GetMapping("/pipelines/{pipelineId}/deliveries")
+    public List<?> listDeliveries(@PathVariable String pipelineId) {
+        return service.listDeliveries(pipelineId);
+    }
+
+    @GetMapping("/deliveries/{deliveryId}")
+    public Object getDelivery(@PathVariable String deliveryId) {
+        return service.getDelivery(deliveryId);
     }
 
     // ---------------- 运行 ----------------

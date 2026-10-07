@@ -111,6 +111,95 @@ POST .../rollback {"environment":"..."}
 - `pauseBeforeStep` / `resume` 仅用于本地和测试时制造确定性时序窗口（例如验证并发与
   取消），非业务必需。
 
+### 4. 批量交付（Delivery）
+
+在单环境提升之上，提供「按版本一口气交付到目标环境」的用法：指定流水线、版本与目标
+环境，系统沿 `DEV -> TEST -> STAGING -> PROD` 的固定顺序把该版本一路送到目标环境。
+
+**顺序规则：**
+
+- 从 `DEV` 开始逐环境规划到目标环境，**不跳过任何中间环境**；目标环境之前的每个环境
+  都会出现在计划里。
+- 某个环境当前**已经是目标版本**时记为 `SKIP`（跳过、不产生新部署记录）；否则记为
+  `PROMOTE`（从 `fromVersion` 变成目标版本）。
+- 目标版本若停在比目标环境更远的环境、或中间环境是别的版本，按计划把沿途环境统一提升/
+  切换到目标版本即可——顺序由「从 DEV 逐环境规划」天然保证，不存在跳级。
+
+**整体成败（原子性）：**
+
+```
+POST .../deliveries {"version":"1.0.0","targetEnvironment":"PROD"}
+  │
+  ├─ 缺 version / targetEnvironment           → INVALID_REQUEST (400)
+  ├─ 目标环境未知                              → INVALID_ENVIRONMENT (400)
+  ├─ 版本不存在                                → VERSION_NOT_FOUND (404)
+  ├─ 版本已 BLOCKED                            → VERSION_BLOCKED (409)
+  ├─ 目标环境当前已是该版本（且无同键已生效交付）→ ALREADY_AT_ENVIRONMENT (409)
+  └─ 规划通过 → 在同一把锁内逐环境一次性提交，生成交付记录与各环境 PROMOTE 历史
+```
+
+- **先规划、后提交**：规划阶段只读，任何一步不可行就**整体拒绝**，响应里带
+  `failureEnvironment`（卡在哪个环境）与既有 `reason`/`message`（因为什么）。
+- 拒绝发生在任何写入之前，因此**绝不会出现前几个环境已改、后面没改的半成品**：
+  被拒后所有相关环境的 `currentVersion`、`previousVersion` 与部署历史都保持原样，
+  也不产生交付记录。
+- 拒绝原因码与单环境提升完全一致（`VERSION_BLOCKED` / `ALREADY_AT_ENVIRONMENT` 等），
+  不引入新的拒绝语义。
+
+**提交前预演（dry-run，绝不改状态）：**
+
+`POST .../deliveries/preview` 返回本次交付的计划，**不修改任何环境、版本与历史**：
+
+```json
+{
+  "dryRun": true,
+  "deliverable": true,
+  "pipelineId": "demo",
+  "version": "1.0.0",
+  "targetEnvironment": "PROD",
+  "steps": [
+    { "environment": "DEV",    "action": "SKIP",    "fromVersion": "1.0.0", "toVersion": "1.0.0" },
+    { "environment": "TEST",   "action": "PROMOTE", "fromVersion": null,    "toVersion": "1.0.0" },
+    { "environment": "STAGING","action": "PROMOTE", "fromVersion": null,    "toVersion": "1.0.0" },
+    { "environment": "PROD",   "action": "PROMOTE", "fromVersion": null,    "toVersion": "1.0.0" }
+  ]
+}
+```
+
+注定跑不通时返回 HTTP 200 但 `deliverable=false`，并给出会卡住的环境、原因码、说明，
+以及走到该步之前已规划出的 `steps`：
+
+```json
+{ "dryRun": true, "deliverable": false,
+  "failureEnvironment": "DEV", "reason": "VERSION_BLOCKED", "message": "版本 1.0.0 已被标记为不可用……",
+  "steps": [] }
+```
+
+> 参数层面非法（缺字段、未知环境）仍按普通请求错误返回 400，不属于预演计划的一部分。
+
+**重复提交与并发（幂等收敛）：**
+
+- 幂等键为 `(流水线, 版本, 目标环境)`。同一键**只有一次真正生效**的交付；之后的重复
+  提交不再执行第二遍，而是收敛到**同一条交付记录**（HTTP 200，`reused=true`），不会新增
+  任何环境变更或部署历史。首次生效返回 HTTP 201（`reused=false`）。
+- 并发提交同一键时，所有请求在同一把进程锁内串行：只有一个请求执行并落库，其余请求拿到
+  同一条记录（`reused=true`）。
+- 注意区分：`ALREADY_AT_ENVIRONMENT` 只在「目标环境当前已是该版本、但不存在同键已生效
+  交付」时出现（例如该状态是用单环境提升达成的）；一旦该键已经成功交付过，重复提交一律
+  幂等收敛而不是再拒绝。
+- 被拒绝的交付不占用幂等键，解除原因后可以重新提交。
+- 已生效交付可通过 `GET .../deliveries` 与 `GET /api/deliveries/{id}` 查询；每个环境由此
+  产生的部署历史记录带 `deliveryId`，可反查归属交付。
+
+**与单环境提升 / 回滚的兼容范围：**
+
+- 批量交付复用同一套环境顺序、版本可用性校验与「先校验后写入」的锁，不改变
+  `POST .../promote`、`POST .../rollback` 的任何行为与拒绝原因。
+- 批量交付在每个环境上产生的是常规 `PROMOTE` 部署记录（额外带 `deliveryId`），之后既可以
+  继续单环境提升，也可以照常回滚；回滚规则不变。
+- 单环境提升/回滚与批量交付共享同一份内存状态，混用是允许的：批量交付的规划总是基于
+  当前最新状态重新计算。
+
 ## 二、HTTP 接口
 
 | 方法 | 路径 | 说明 |
@@ -121,8 +210,12 @@ POST .../rollback {"environment":"..."}
 | GET/POST | `/api/pipelines/{id}/versions` | 版本列表 / 提交（body: `version,commitRef?`） |
 | POST | `/api/pipelines/{id}/versions/{v}/block` | 隔离版本 |
 | GET | `/api/pipelines/{id}/environments[/{env}]` | 各环境槽位状态、历史、最近拒绝原因 |
-| POST | `/api/pipelines/{id}/promote` | 提升（body: `version?,targetEnvironment?`） |
+| POST | `/api/pipelines/{id}/promote` | 单环境提升（body: `version?,targetEnvironment?`） |
 | POST | `/api/pipelines/{id}/rollback` | 回滚（body: `environment`） |
+| POST | `/api/pipelines/{id}/deliveries/preview` | 批量交付预演（body: `version,targetEnvironment`，不改状态） |
+| POST | `/api/pipelines/{id}/deliveries` | 批量交付到目标环境（首次 201，重复复用 200 `reused=true`） |
+| GET | `/api/pipelines/{id}/deliveries` | 该流水线全部批量交付记录 |
+| GET | `/api/deliveries/{deliveryId}` | 单次批量交付（含各环境环节与部署记录 id） |
 | POST | `/api/pipelines/{id}/runs` | 触发运行（body: `version,failAtStep?,pauseBeforeStep?`） |
 | GET | `/api/pipelines/{id}/runs` | 该流水线全部运行记录 |
 | GET | `/api/runs/{runId}` | 单次运行（含每一步状态、失败点、失败原因） |
@@ -142,11 +235,23 @@ POST .../rollback {"environment":"..."}
 ```
 
 原因码一览：`INVALID_REQUEST`、`INVALID_VERSION`、`INVALID_ENVIRONMENT`、
-`PIPELINE_NOT_FOUND`、`VERSION_NOT_FOUND`、`RUN_NOT_FOUND`、
+`PIPELINE_NOT_FOUND`、`VERSION_NOT_FOUND`、`RUN_NOT_FOUND`、`DELIVERY_NOT_FOUND`、
 `VERSION_ALREADY_EXISTS`、`VERSION_REGRESSION`、`VERSION_BLOCKED`、
 `SOURCE_ENVIRONMENT_EMPTY`、`PROMOTION_VERSION_MISMATCH`、`ALREADY_AT_ENVIRONMENT`、
 `NO_ROLLBACK_TARGET`、`RUN_ALREADY_ACTIVE`、`RUN_NOT_CANCELLABLE`、
 `RETRY_NOT_ALLOWED`、`RETRY_ALREADY_ACTIVE`。
+
+批量交付被整体拒绝时，错误体在上述字段外额外给出 `failureEnvironment`：
+
+```json
+{
+  "rejected": true,
+  "reason": "VERSION_BLOCKED",
+  "message": "版本 1.0.0 已被标记为不可用，不能交付到 DEV",
+  "failureEnvironment": "DEV",
+  "at": "2026-10-08T07:00:00Z"
+}
+```
 
 ## 三、本地运行与验证
 
@@ -195,20 +300,69 @@ curl -s localhost:8080/api/pipelines/demo/runs          # 看 failedStep / failu
 curl -s -X POST localhost:8080/api/runs/run-2/retry     # 对失败运行重试（id 以实际返回为准）
 ```
 
+### 批量交付演练（另建一条流水线，避免与上面的状态混淆）
+
+```bash
+# 1. 建流水线、交版本
+curl -s -X POST localhost:8080/api/pipelines -H 'Content-Type: application/json' \
+  -d '{"id":"rel"}'
+curl -s -X POST localhost:8080/api/pipelines/rel/versions -H 'Content-Type: application/json' \
+  -d '{"version":"3.0.0"}'
+
+# 2. 先预演：dryRun=true，给出 DEV..PROD 四个 PROMOTE 环节，不改任何状态
+curl -s -X POST localhost:8080/api/pipelines/rel/deliveries/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"3.0.0","targetEnvironment":"PROD"}'
+
+# 3. 正式交付：首次 201，四个环境一口气全部生效
+curl -i -s -X POST localhost:8080/api/pipelines/rel/deliveries \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"3.0.0","targetEnvironment":"PROD"}'
+
+# 4. 重复提交同一交付：200 + reused=true，收敛到同一条记录，不再产生部署历史
+curl -i -s -X POST localhost:8080/api/pipelines/rel/deliveries \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"3.0.0","targetEnvironment":"PROD"}'
+curl -s localhost:8080/api/pipelines/rel/deliveries     # 只有一条交付记录
+
+# 5. 整体被拒示例：隔离一个新版本后交付到 PROD，
+#    409 + failureEnvironment=DEV + VERSION_BLOCKED，四环境状态与历史完全不变
+curl -s -X POST localhost:8080/api/pipelines/rel/versions -H 'Content-Type: application/json' \
+  -d '{"version":"3.1.0"}'
+curl -s -X POST localhost:8080/api/pipelines/rel/versions/3.1.0/block
+curl -i -s -X POST localhost:8080/api/pipelines/rel/deliveries \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"3.1.0","targetEnvironment":"PROD"}'
+
+# 6. 预演注定失败的交付：200 + deliverable=false，同样不改状态
+curl -s -X POST localhost:8080/api/pipelines/rel/deliveries/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"3.1.0","targetEnvironment":"PROD"}'
+```
+
 ### 运行测试
 
 ```bash
 mvn test
 ```
 
-测试共 11 个场景（另有 Spring 上下文冒烟 1 个），日志里带 `[场景N]` / `[接口X]`
-前缀，可以直接看出每个场景在验证什么、结论是否「=> 通过」：
+测试共 26 个场景（另有 Spring 上下文冒烟 1 个），日志里带 `[场景N]` / `[接口X]` /
+`[批量N]` 前缀，可以直接看出每个场景在验证什么、结论是否「=> 通过」：
 
 - 服务层 `OrchestrationServiceTest`（7 个）：版本冲突（重复/回退/非法格式/历史保留）、
   跨环境提升（跳级/版本不符/重复/阻塞）、回滚（成功/无目标/旧版本被隔离）、
   并发触发与取消、失败可见与重试、进行中重复重试。
-- 接口层 `ApiControllerTest`（4 个）：上述关键场景经 HTTP 的状态码与原因码、
-  环境上的拒绝原因查询、运行步骤明细与取消后不冒新结果。
+- 接口层 `ApiControllerTest`（7 个）：上述关键场景经 HTTP 的状态码与原因码、
+  环境上的拒绝原因查询、运行步骤明细与取消后不冒新结果；以及批量交付的预演+正式交付、
+  整体被拒（409 含 `failureEnvironment` 且状态不变）、重复提交 201→200 幂等收敛。
+- 服务层 `BatchDeliveryServiceTest`（12 个）：
+  - 顺利跑通：空盘一路到 PROD、部分环境已是目标版本时 SKIP；
+  - 整体被拒不留痕：目标已在该版本、版本 BLOCKED、版本不存在，断言四个环境的当前版本与
+    部署历史快照在拒绝前后完全一致，且不产生交付记录；
+  - 预演不改状态：可通时给出各环境 from→to，不可通时给出被卡环境与原因；
+  - 幂等与并发：同键重复提交收敛到同一条记录（`reused=true`），8 线程并发只有 1 次真正
+    生效、其余复用同一结果，且各环境历史不增加；
+  - 被拒后可重新交付、参数非法与交付记录查询。
 
 ## 四、范围说明
 

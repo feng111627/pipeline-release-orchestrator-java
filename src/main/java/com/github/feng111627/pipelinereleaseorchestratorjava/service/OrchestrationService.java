@@ -1,13 +1,19 @@
 package com.github.feng111627.pipelinereleaseorchestratorjava.service;
 
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.CreatePipelineRequest;
+import com.github.feng111627.pipelinereleaseorchestratorjava.dto.BatchDeliveryRequest;
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.PromoteRequest;
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.RollbackRequest;
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.SubmitVersionRequest;
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.TriggerRunRequest;
 import com.github.feng111627.pipelinereleaseorchestratorjava.exception.RejectedException;
+import com.github.feng111627.pipelinereleaseorchestratorjava.exception.DeliveryPlanRejectedException;
 import com.github.feng111627.pipelinereleaseorchestratorjava.model.DeploymentAction;
 import com.github.feng111627.pipelinereleaseorchestratorjava.model.DeploymentRecord;
+import com.github.feng111627.pipelinereleaseorchestratorjava.model.DeliveryPreview;
+import com.github.feng111627.pipelinereleaseorchestratorjava.model.DeliveryRecord;
+import com.github.feng111627.pipelinereleaseorchestratorjava.model.DeliveryStep;
+import com.github.feng111627.pipelinereleaseorchestratorjava.model.DeliveryStepType;
 import com.github.feng111627.pipelinereleaseorchestratorjava.model.EnvironmentSlot;
 import com.github.feng111627.pipelinereleaseorchestratorjava.model.PipelineDefinition;
 import com.github.feng111627.pipelinereleaseorchestratorjava.model.PipelineVersion;
@@ -55,6 +61,13 @@ public class OrchestrationService {
     private final Map<String, CountDownLatch> pauseGates = new ConcurrentHashMap<>();
     private final AtomicLong deploymentSeq = new AtomicLong();
     private final AtomicLong runSeq = new AtomicLong();
+    private final AtomicLong deliverySeq = new AtomicLong();
+    /** 已生效的批量交付记录，按 id 查询。 */
+    private final Map<String, DeliveryRecord> deliveriesById = new ConcurrentHashMap<>();
+    /** 每条流水线的全部批量交付记录（只追加）。 */
+    private final Map<String, List<DeliveryRecord>> deliveriesByPipeline = new ConcurrentHashMap<>();
+    /** 幂等键 pipelineId|version|targetEnvironment -> 已生效交付。 */
+    private final Map<String, DeliveryRecord> deliveriesByKey = new ConcurrentHashMap<>();
 
     private final ExecutorService executor = Executors.newFixedThreadPool(4, r -> {
         Thread t = new Thread(r, "pipeline-run-worker");
@@ -101,6 +114,7 @@ public class OrchestrationService {
             pipelines.put(id, def);
             slotsByPipeline.put(id, createSlots(id));
             runsByPipeline.put(id, new ArrayList<>());
+            deliveriesByPipeline.put(id, new ArrayList<>());
             return def;
         }
     }
@@ -328,6 +342,179 @@ public class OrchestrationService {
             history.add(record);
             return record;
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // 批量交付：预演 / 执行 / 查询（原子、幂等）
+    // ---------------------------------------------------------------------
+
+    /**
+     * 预演批量交付：不写任何状态。业务上注定跑不通时返回 deliverable=false 的预演结果，
+     * 只有参数层面非法（缺字段/未知环境）才按普通请求错误抛出。
+     */
+    public DeliveryPreview previewDelivery(String pipelineId, BatchDeliveryRequest request) {
+        PipelineDefinition def = getPipeline(pipelineId);
+        String[] parsed = parseDeliveryRequest(request);
+        String version = parsed[0];
+        String targetEnv = parsed[1];
+        int targetIdx = envIndex(targetEnv); // 未知环境 -> INVALID_ENVIRONMENT（普通 400）
+
+        synchronized (mutex) {
+            List<EnvironmentSlot> slots = slotsByPipeline.get(pipelineId);
+            try {
+                List<DeliveryStep> steps = planDelivery(def, slots, version, targetIdx);
+                return DeliveryPreview.ok(pipelineId, version, targetEnv, steps);
+            } catch (DeliveryPlanRejectedException ex) {
+                return DeliveryPreview.rejected(pipelineId, version, targetEnv, ex.getPartialSteps(),
+                        ex.getFailureEnvironment(), ex.getReason(), ex.getMessage());
+            }
+        }
+    }
+
+    /**
+     * 执行批量交付。整体原子：规划（只读）通过后才一次性提交全部环节；
+     * 任何一步在规划阶段被拒，整个交付拒绝、环境与部署历史完全不变。
+     * 幂等：同 (pipeline, version, targetEnv) 的已生效交付会被直接复用（reused=true），
+     * 并发提交在同一把锁内串行，只有一次真正生效。
+     */
+    public DeliveryRecord deliver(String pipelineId, BatchDeliveryRequest request) {
+        PipelineDefinition def = getPipeline(pipelineId);
+        String[] parsed = parseDeliveryRequest(request);
+        String version = parsed[0];
+        String targetEnv = parsed[1];
+        int targetIdx = envIndex(targetEnv);
+
+        synchronized (mutex) {
+            String key = deliveryKey(pipelineId, version, targetEnv);
+            DeliveryRecord existing = deliveriesByKey.get(key);
+            if (existing != null) {
+                // 重复提交（含并发后到者）：收敛到同一次结果，不再执行第二遍。
+                return existing.withReused(true);
+            }
+            List<EnvironmentSlot> slots = slotsByPipeline.get(pipelineId);
+            // 先做全程只读规划：任何拒绝都发生在任何写入之前，杜绝半成品状态。
+            List<DeliveryStep> plan = planDelivery(def, slots, version, targetIdx);
+            return commitDelivery(def, slots, version, targetEnv, plan, key);
+        }
+    }
+
+    public List<DeliveryRecord> listDeliveries(String pipelineId) {
+        getPipeline(pipelineId);
+        synchronized (mutex) {
+            return List.copyOf(deliveriesByPipeline.get(pipelineId));
+        }
+    }
+
+    public DeliveryRecord getDelivery(String deliveryId) {
+        DeliveryRecord record = deliveriesById.get(deliveryId);
+        if (record == null) {
+            throw reject(RejectReason.DELIVERY_NOT_FOUND, "批量交付记录不存在: " + deliveryId);
+        }
+        return record;
+    }
+
+    /**
+     * 只读规划：沿 DEV..target 逐个环境得出 PROMOTE/SKIP 环节，全程不修改槽位。
+     * 校验语义与单环境提升保持一致；任何一步不可行就抛
+     * {@link DeliveryPlanRejectedException}，指出被卡环境、原因及此前已规划的环节。
+     */
+    private List<DeliveryStep> planDelivery(PipelineDefinition def, List<EnvironmentSlot> slots,
+                                            String version, int targetIdx) {
+        // 调用方已持锁。
+        // 目标环境已经是该版本：整体拒绝（不允许把重复提交悄悄当成一次新交付）。
+        if (version.equals(slots.get(targetIdx).getCurrentVersion())) {
+            throw planRejected(ENVIRONMENTS.get(targetIdx), RejectReason.ALREADY_AT_ENVIRONMENT,
+                    "环境 " + ENVIRONMENTS.get(targetIdx) + " 当前已经是版本 " + version
+                            + "，无需重复交付", List.of());
+        }
+
+        List<DeliveryStep> steps = new ArrayList<>();
+        for (int i = 0; i <= targetIdx; i++) {
+            String env = ENVIRONMENTS.get(i);
+            EnvironmentSlot slot = slots.get(i);
+            String current = slot.getCurrentVersion();
+            if (version.equals(current)) {
+                // 已经是目标版本：跳过，不产生部署记录。
+                steps.add(new DeliveryStep(env, DeliveryStepType.SKIP, current, version));
+                continue;
+            }
+            // 沿 DEV..target 逐环境规划，顺序由遍历本身保证，不会跳过任何环境：
+            // 走到第 i 个环境时，第 i-1 个环境必然已有一个最终落到目标版本的环节
+            // （上游当前已是 -> SKIP，否则已在本批前面被规划为 PROMOTE）。
+            if (i > 0 && !version.equals(steps.get(i - 1).toVersion())) {
+                // 防御性不变量：上游环节必须已规划到目标版本，正常顺序下不可达。
+                throw planRejected(env, RejectReason.PROMOTION_VERSION_MISMATCH,
+                        "上游环境 " + ENVIRONMENTS.get(i - 1) + " 未规划到版本 " + version
+                                + "，交付顺序不成立", steps);
+            }
+            // 版本必须存在且可用（与单环境提升同样的原因码；在第一个需要变更的环境处校验）。
+            PipelineVersion pv = findVersionOrNull(def, version);
+            if (pv == null) {
+                throw planRejected(env, RejectReason.VERSION_NOT_FOUND,
+                        "流水线 " + def.getId() + " 不存在版本 " + version, steps);
+            }
+            if (pv.getStatus() == VersionStatus.BLOCKED) {
+                throw planRejected(env, RejectReason.VERSION_BLOCKED,
+                        "版本 " + version + " 已被标记为不可用，不能交付到 " + env, steps);
+            }
+            steps.add(new DeliveryStep(env, DeliveryStepType.PROMOTE, current, version));
+        }
+        return steps;
+    }
+
+    /** 校验全部通过后在锁内一次性提交：逐环境落库，全部成功才生成交付记录。 */
+    private DeliveryRecord commitDelivery(PipelineDefinition def, List<EnvironmentSlot> slots,
+                                          String version, String targetEnv, List<DeliveryStep> plan,
+                                          String key) {
+        // 调用方已持锁；plan 已通过全部校验，此处不再有拒绝分支。
+        String deliveryId = "delivery-" + deliverySeq.incrementAndGet();
+        Instant now = Instant.now();
+        List<String> deploymentIds = new ArrayList<>();
+        for (DeliveryStep step : plan) {
+            if (step.action() == DeliveryStepType.SKIP) {
+                continue;
+            }
+            int idx = ENVIRONMENTS.indexOf(step.environment());
+            EnvironmentSlot slot = slots.get(idx);
+            String previous = slot.getCurrentVersion();
+            slot.setPreviousVersion(previous);
+            slot.setCurrentVersion(step.toVersion());
+            slot.setCurrentAt(now);
+            slot.setLastAction(DeploymentAction.PROMOTE);
+            slot.setLastRejection(null);
+            slot.setLastRejectionMessage(null);
+            slot.setLastRejectionAt(null);
+            DeploymentRecord record = new DeploymentRecord(
+                    "dep-" + deploymentSeq.incrementAndGet(), def.getId(), step.environment(),
+                    version, DeploymentAction.PROMOTE, previous, now, deliveryId);
+            slot.getHistory().add(record);
+            deploymentIds.add(record.getId());
+        }
+        DeliveryRecord delivery = new DeliveryRecord(deliveryId, def.getId(), version, targetEnv,
+                plan, deploymentIds, now);
+        deliveriesById.put(deliveryId, delivery);
+        deliveriesByPipeline.get(def.getId()).add(delivery);
+        deliveriesByKey.put(key, delivery);
+        return delivery;
+    }
+
+    private static String[] parseDeliveryRequest(BatchDeliveryRequest request) {
+        if (request == null || isBlank(request.getVersion()) || isBlank(request.getTargetEnvironment())) {
+            throw reject(RejectReason.INVALID_REQUEST,
+                    "批量交付必须同时指定 version 与 targetEnvironment");
+        }
+        return new String[] {request.getVersion().trim(),
+                request.getTargetEnvironment().trim().toUpperCase()};
+    }
+
+    private static String deliveryKey(String pipelineId, String version, String targetEnv) {
+        return pipelineId + "|" + version + "|" + targetEnv;
+    }
+
+    private static DeliveryPlanRejectedException planRejected(String environment, RejectReason reason,
+                                                              String message,
+                                                              List<DeliveryStep> partialSteps) {
+        return new DeliveryPlanRejectedException(environment, reason, message, partialSteps);
     }
 
     // ---------------------------------------------------------------------

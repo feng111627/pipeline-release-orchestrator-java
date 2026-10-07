@@ -12,9 +12,17 @@ public class DeploymentRecord {
     /** 回滚时，被替换掉的版本；提升时为 null。 */
     private final String fromVersion;
     private final Instant at;
+    /** 若该部署由批量交付产生，为对应交付 id；单环境提升/回滚为 null。 */
+    private final String deliveryId;
 
     public DeploymentRecord(String id, String pipelineId, String environment, String version,
                             DeploymentAction action, String fromVersion, Instant at) {
+        this(id, pipelineId, environment, version, action, fromVersion, at, null);
+    }
+
+    public DeploymentRecord(String id, String pipelineId, String environment, String version,
+                            DeploymentAction action, String fromVersion, Instant at,
+                            String deliveryId) {
         this.id = id;
         this.pipelineId = pipelineId;
         this.environment = environment;
@@ -22,6 +30,7 @@ public class DeploymentRecord {
         this.action = action;
         this.fromVersion = fromVersion;
         this.at = at;
+        this.deliveryId = deliveryId;
     }
 
     public String getId() { return id; }
@@ -31,4 +40,5 @@ public class DeploymentRecord {
     public DeploymentAction getAction() { return action; }
     public String getFromVersion() { return fromVersion; }
     public Instant getAt() { return at; }
+    public String getDeliveryId() { return deliveryId; }
 }
