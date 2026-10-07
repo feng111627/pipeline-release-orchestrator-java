@@ -22,7 +22,7 @@ public class GlobalExceptionHandler {
 
     private static final Set<RejectReason> NOT_FOUND =
             Set.of(RejectReason.PIPELINE_NOT_FOUND, RejectReason.VERSION_NOT_FOUND,
-                    RejectReason.RUN_NOT_FOUND);
+                    RejectReason.RUN_NOT_FOUND, RejectReason.DELIVERY_NOT_FOUND);
 
     private static final Set<RejectReason> BAD_REQUEST =
             Set.of(RejectReason.INVALID_REQUEST, RejectReason.INVALID_VERSION,
@@ -39,20 +39,25 @@ public class GlobalExceptionHandler {
         } else {
             status = HttpStatus.CONFLICT;
         }
-        return ResponseEntity.status(status).body(body(reason.name(), ex.getMessage()));
+        return ResponseEntity.status(status).body(body(reason.name(), ex.getMessage(), ex.getEnvironment()));
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<Map<String, Object>> handleUnreadable(HttpMessageNotReadableException ex) {
         return ResponseEntity.badRequest()
-                .body(body(RejectReason.INVALID_REQUEST.name(), "请求体无法解析: " + ex.getMessage()));
+                .body(body(RejectReason.INVALID_REQUEST.name(), "请求体无法解析: " + ex.getMessage(), null));
     }
 
-    private static Map<String, Object> body(String reason, String message) {
-        return Map.of(
-                "rejected", true,
-                "reason", reason,
-                "message", message == null ? "" : message,
-                "at", Instant.now().toString());
+    private static Map<String, Object> body(String reason, String message, String environment) {
+        java.util.LinkedHashMap<String, Object> map = new java.util.LinkedHashMap<>();
+        map.put("rejected", true);
+        map.put("reason", reason);
+        map.put("message", message == null ? "" : message);
+        if (environment != null) {
+            // 仅批量交付等需要定位「卡在哪个环境」的拒绝会带上该字段。
+            map.put("environment", environment);
+        }
+        map.put("at", Instant.now().toString());
+        return map;
     }
 }

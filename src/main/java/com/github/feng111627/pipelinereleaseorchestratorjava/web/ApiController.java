@@ -1,6 +1,7 @@
 package com.github.feng111627.pipelinereleaseorchestratorjava.web;
 
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.CreatePipelineRequest;
+import com.github.feng111627.pipelinereleaseorchestratorjava.dto.DeliverRequest;
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.PromoteRequest;
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.RollbackRequest;
 import com.github.feng111627.pipelinereleaseorchestratorjava.dto.SubmitVersionRequest;
@@ -94,6 +95,28 @@ public class ApiController {
     public Object rollback(@PathVariable String pipelineId,
                            @RequestBody RollbackRequest request) {
         return service.rollback(pipelineId, request);
+    }
+
+    // ---------------- 批量交付 ----------------
+
+    @PostMapping("/pipelines/{pipelineId}/deliveries")
+    public ResponseEntity<Object> deliver(@PathVariable String pipelineId,
+                                          @RequestBody(required = false) DeliverRequest request) {
+        if (request != null && request.isDryRun()) {
+            // 预演不产生任何新结论，返回 200 + 计划/失败点。
+            return ResponseEntity.ok(service.previewDeliver(pipelineId, request));
+        }
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.deliver(pipelineId, request));
+    }
+
+    @GetMapping("/pipelines/{pipelineId}/deliveries")
+    public List<?> listDeliveries(@PathVariable String pipelineId) {
+        return service.listDeliveries(pipelineId);
+    }
+
+    @GetMapping("/deliveries/{deliveryId}")
+    public Object getDelivery(@PathVariable String deliveryId) {
+        return service.getDelivery(deliveryId);
     }
 
     // ---------------- 运行 ----------------
